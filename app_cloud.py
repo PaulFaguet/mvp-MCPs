@@ -1,41 +1,36 @@
-"""MVP — Chatbot Mistral branché sur les MCP Super U & Picard (version Streamlit Cloud)."""
+"""MVP — Chatbot Mistral × Super U × Picard (version Cloud, sans subprocess MCP)."""
 
-import asyncio
 import json
 import os
 import random
 import re
-import threading
+import sys
 import time
-from contextlib import AsyncExitStack
+import uuid
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(APP_DIR, "mcp-superu"))
+sys.path.insert(0, os.path.join(APP_DIR, "mcp-picard"))
+
 import streamlit as st
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from mistralai import Mistral
 from mistralai.models import SDKError
 
+from src.api.client import PicardClient
+from src.api.models import Cart as PicardCart
+from src.api.models import Product as PicardProduct
+
+sys.path.remove(os.path.join(APP_DIR, "mcp-picard"))
+
+from src.api.client import SuperUClient
+from src.api.models import Cart as SuperUCart
+from src.api.models import Product as SuperUProduct
+
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-SERVERS = {
-    "superu": StdioServerParameters(
-        command="python3", args=["-m", "src.server"],
-        env={**os.environ, "PYTHONPATH": os.path.join(APP_DIR, "mcp-superu")},
-        cwd=os.path.join(APP_DIR, "mcp-superu"),
-    ),
-    "picard": StdioServerParameters(
-        command="python3", args=["-m", "src.server"],
-        env={**os.environ, "PYTHONPATH": os.path.join(APP_DIR, "mcp-picard")},
-        cwd=os.path.join(APP_DIR, "mcp-picard"),
-    ),
-}
-
 MAX_STORES = 7
 MAX_ROUNDS = 6
 TEMPERATURE = 0.2
@@ -55,6 +50,303 @@ THINKING_VERBS = [
     "Je compare les prix au kilo…",
 ]
 
+# ── Config Super U ───────────────────────────────────────────────────────────
+
+_superu_config_path = os.path.join(APP_DIR, "mcp-superu", "config", "config.json")
+try:
+    with open(_superu_config_path, encoding="utf-8") as f:
+        _superu_config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    _superu_config = {}
+
+_picard_config_path = os.path.join(APP_DIR, "mcp-picard", "config", "config.json")
+try:
+    with open(_picard_config_path, encoding="utf-8") as f:
+        _picard_config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    _picard_config = {}
+
+superu_client = SuperUClient(
+    store_slug=_superu_config.get("store", _superu_config.get("store_slug", "puteaux")),
+    stores=_superu_config.get("stores"),
+    cache_ttl_minutes=_superu_config.get("cache_ttl_minutes", 30),
+)
+picard_client = PicardClient(
+    cache_ttl_minutes=_picard_config.get("cache_ttl_minutes", 30),
+    request_delay=_picard_config.get("request_delay_seconds", 1.0),
+)
+superu_cart = SuperUCart(id=str(uuid.uuid4()))
+picard_cart = PicardCart(id=str(uuid.uuid4()))
+
+
+# ── Tool specs (identiques aux MCP servers) ──────────────────────────────────
+
+SUPERU_TOOLS = [
+    {"type": "function", "function": {"name": "superu__search_products", "description": "Rechercher des produits dans le catalogue Super U Drive.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "default": 10}, "sort_by": {"type": "string", "enum": ["relevance", "price_asc", "price_desc"], "default": "relevance"}, "store": {"type": "string", "description": "Optionnel : magasin ciblé (preset, nom ou slug)."}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "superu__get_product_details", "description": "Détails d'un produit Super U (prix/unité, nutriscore, nutrition, ingrédients).", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}, "store": {"type": "string"}}, "required": ["product_id"]}}},
+    {"type": "function", "function": {"name": "superu__compare_prices", "description": "Comparer le prix d'un produit entre magasins préconfigurés.", "parameters": {"type": "object", "properties": {"product": {"type": "string"}, "stores": {"type": "array", "items": {"type": "string"}}}, "required": ["product"]}}},
+    {"type": "function", "function": {"name": "superu__find_stores", "description": "Trouver les magasins/drives Super U proches d'un code postal.", "parameters": {"type": "object", "properties": {"postal_code": {"type": "string"}}, "required": ["postal_code"]}}},
+    {"type": "function", "function": {"name": "superu__get_promotions", "description": "Promotions Super U en cours pour une catégorie.", "parameters": {"type": "object", "properties": {"category": {"type": "string"}}, "required": ["category"]}}},
+    {"type": "function", "function": {"name": "superu__set_store", "description": "Changer le magasin actif (les prix en dépendent).", "parameters": {"type": "object", "properties": {"store": {"type": "string"}}, "required": ["store"]}}},
+    {"type": "function", "function": {"name": "superu__list_stores", "description": "Lister les magasins préconfigurés et le magasin actif.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "superu__add_to_cart", "description": "Ajouter des produits au panier Super U.", "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"product_id": {"type": "string"}, "name": {"type": "string"}, "price": {"type": "number"}, "quantity": {"type": "integer", "default": 1}}, "required": ["product_id", "name", "price"]}}}, "required": ["items"]}}},
+    {"type": "function", "function": {"name": "superu__view_cart", "description": "Voir le panier Super U.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "superu__remove_from_cart", "description": "Retirer un produit du panier Super U.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}},
+]
+
+PICARD_TOOLS = [
+    {"type": "function", "function": {"name": "picard__search_products", "description": "Rechercher des produits surgelés Picard.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "default": 10}, "sort_by": {"type": "string", "enum": ["relevance", "price_asc", "price_desc", "rating", "reviews"], "default": "relevance"}, "nutriscore_filter": {"type": "string", "enum": ["A", "B", "C", "D", "E"]}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "picard__get_product_details", "description": "Fiche complète d'un produit Picard (prix, nutrition, ingrédients).", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}},
+    {"type": "function", "function": {"name": "picard__browse_category", "description": "Parcourir un rayon Picard (feculents, legumes, plats-cuisines, poissons, viandes, desserts, pizzas, promotions, etc.).", "parameters": {"type": "object", "properties": {"category": {"type": "string"}, "sort_by": {"type": "string", "enum": ["relevance", "price_asc", "price_desc", "rating", "reviews"], "default": "relevance"}, "nutriscore_filter": {"type": "string", "enum": ["A", "B", "C", "D", "E"]}, "max_results": {"type": "integer", "default": 20}}, "required": ["category"]}}},
+    {"type": "function", "function": {"name": "picard__get_promotions", "description": "Produits Picard en promotion.", "parameters": {"type": "object", "properties": {"max_results": {"type": "integer", "default": 20}}}}},
+    {"type": "function", "function": {"name": "picard__compare_nutrition", "description": "Comparer plusieurs produits Picard par valeurs nutritionnelles.", "parameters": {"type": "object", "properties": {"product_ids": {"type": "array", "items": {"type": "string"}}, "sort_by_field": {"type": "string", "enum": ["proteines", "kcal", "fibres", "lipides", "glucides", "sucres", "sel", "prix_kg"], "default": "proteines"}}, "required": ["product_ids"]}}},
+    {"type": "function", "function": {"name": "picard__find_stores", "description": "Magasins Picard proches d'un code postal.", "parameters": {"type": "object", "properties": {"postal_code": {"type": "string"}}, "required": ["postal_code"]}}},
+    {"type": "function", "function": {"name": "picard__add_to_cart", "description": "Ajouter des produits au panier Picard.", "parameters": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"product_id": {"type": "string"}, "name": {"type": "string"}, "price": {"type": "number"}, "quantity": {"type": "integer", "default": 1}}, "required": ["product_id", "name", "price"]}}}, "required": ["items"]}}},
+    {"type": "function", "function": {"name": "picard__view_cart", "description": "Voir le panier Picard.", "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "picard__remove_from_cart", "description": "Retirer un produit du panier Picard.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}},
+]
+
+
+# ── Tool handlers ────────────────────────────────────────────────────────────
+
+def _fmt_superu_product(i: int, p: dict) -> str:
+    price_str = f"{p['price']:.2f}€" if p["price"] > 0 else "Prix non dispo"
+    bio = " [BIO]" if p.get("is_bio") else ""
+    note = f" | Note: {p['rating']}/5" if p.get("rating") else ""
+    promo = f"\n   PROMO: {p['promo_detail']}" if p.get("is_promo") and p.get("promo_detail") else ""
+    lien = f"\n   Lien: {p['url']}" if p.get("url") else ""
+    return (
+        f"{i}. **{p['name']}**{bio}\n"
+        f"   Prix: {price_str} | Marque: {p['brand'] or '—'} | EAN: {p['ean'] or '—'} | ID: {p['id']}{note}{promo}{lien}\n"
+    )
+
+
+def _fmt_picard_product(i: int, p: dict) -> str:
+    price_str = f"{p['price']:.2f}€" if p["price"] > 0 else "Prix non dispo"
+    fmt = f" ({p['format']})" if p.get("format") else ""
+    ns = f" | Nutri: {p['nutriscore']}" if p.get("nutriscore") else ""
+    ps = f" | Planet: {p['planetscore']}" if p.get("planetscore") else ""
+    note = f" | Note: {p['rating']}/5" if p.get("rating") else ""
+    promo = f"\n   PROMO: {p['promo']}" if p.get("promo") else ""
+    lien = f"\n   Lien: {p['url']}" if p.get("url") else ""
+    return (
+        f"{i}. **{p['name']}**{fmt}\n"
+        f"   Prix: {price_str}{ns}{ps}{note} | ID: {p['id']}{promo}{lien}\n"
+    )
+
+
+def handle_tool(name: str, args: dict) -> str:
+    global superu_cart, picard_cart
+
+    try:
+        # ── Super U ──────────────────────────────────────────────────────
+        if name == "superu__search_products":
+            if args.get("store"):
+                superu_client.set_store(args["store"])
+            results = superu_client.search_products(
+                query=args["query"],
+                max_results=min(args.get("max_results", 10), 30),
+                sort_by=args.get("sort_by", "relevance"),
+            )
+            if not results:
+                return "Aucun produit trouvé pour cette recherche."
+            lines = [f"**{len(results)} produit(s) pour \"{args['query']}\"** (magasin actif : {superu_client.store_label()})\n"]
+            lines += [_fmt_superu_product(i, p) for i, p in enumerate(results, 1)]
+            return "\n".join(lines)
+
+        elif name == "superu__get_product_details":
+            if args.get("store"):
+                superu_client.set_store(args["store"])
+            product = superu_client.get_product_details(args["product_id"])
+            if not product:
+                return "Produit introuvable."
+            product["store"] = superu_client.store_label()
+            return json.dumps(product, indent=2, ensure_ascii=False)
+
+        elif name == "superu__compare_prices":
+            data = superu_client.compare_prices(args["product"], args.get("stores"))
+            rows = data["results"]
+            if not rows:
+                return f"Produit introuvable : {args['product']}"
+            lines = [f"**Comparaison pour : {data['product']}** (id {data['id']})\n"]
+            for i, r in enumerate(rows, 1):
+                price = f"{r['price']:.2f}€" if r["price"] > 0 else "non dispo"
+                unit = f" ({r['price_per_unit']})" if r["price_per_unit"] else ""
+                tag = "  ⬅ le moins cher" if i == 1 and r["price"] > 0 else ""
+                lien = f"\n   Lien: {r['url']}" if r.get("url") else ""
+                lines.append(f"{i}. **{r['store_name']}** — {price}{unit}{tag}{lien}")
+            valid = [r["price"] for r in rows if r["price"] > 0]
+            if len(valid) > 1:
+                lines.append(f"\nÉcart : {max(valid) - min(valid):.2f}€ entre le plus cher et le moins cher.")
+            return "\n".join(lines)
+
+        elif name == "superu__find_stores":
+            stores = superu_client.find_stores(postal_code=args["postal_code"])
+            if not stores:
+                return "Aucun magasin trouvé."
+            lines = [f"**{len(stores)} magasin(s) près de {args['postal_code']}**\n"]
+            for s in stores:
+                slug = f"\n  Drive slug: `{s['drive_slug']}`" if s.get("drive_slug") else ""
+                lines.append(f"- **{s['name']}** (ID: {s['id']})\n  {s['address']}{slug}")
+            return "\n".join(lines)
+
+        elif name == "superu__get_promotions":
+            results = superu_client.get_promotions(args["category"])
+            if not results:
+                return "Aucune promotion trouvée."
+            lines = [f"**Promotions pour \"{args['category']}\" :**\n"]
+            for p in results:
+                price_str = f"{p['price']:.2f}€" if p["price"] > 0 else "Prix non dispo"
+                promo = f" — {p['promo_detail']}" if p.get("promo_detail") else ""
+                lien = f"\n    Lien: {p['url']}" if p.get("url") else ""
+                lines.append(f"  - {p['name']} — {price_str}{promo} (ID: {p['id']}){lien}")
+            return "\n".join(lines)
+
+        elif name == "superu__set_store":
+            slug = superu_client.set_store(args["store"])
+            label = next(
+                (p["name"] for p in superu_client.stores.values() if p.get("slug") == slug),
+                slug,
+            )
+            return f"Magasin actif : **{label}** (slug `{slug}`). Les prix suivants viendront de ce magasin."
+
+        elif name == "superu__list_stores":
+            if not superu_client.stores:
+                return f"Magasin actif (slug) : {superu_client.store_slug}"
+            lines = ["**Magasins préconfigurés :**\n"]
+            for key, p in superu_client.stores.items():
+                active = "  ← actif" if p.get("slug") == superu_client.store_slug else ""
+                lines.append(f"- `{key}` — {p.get('name', '')} ({p.get('address', '')}){active}")
+            return "\n".join(lines)
+
+        elif name == "superu__add_to_cart":
+            added = []
+            for item in args["items"]:
+                product = SuperUProduct(id=item["product_id"], name=item["name"], brand="", price=item["price"], price_per_unit="", image_url="", available=True, url="", ean=item["product_id"])
+                superu_cart.add_item(product, item.get("quantity", 1))
+                added.append(f"  - {item.get('quantity', 1)}x {item['name']} ({item['price']:.2f}€)")
+            return f"**Produit(s) ajouté(s) :**\n" + "\n".join(added) + f"\n\n**Total : {superu_cart.total:.2f}€** ({superu_cart.item_count} article(s))"
+
+        elif name == "superu__view_cart":
+            if not superu_cart.items:
+                return "Le panier Super U est vide."
+            lines = ["**Panier Super U :**\n"]
+            for item in superu_cart.items:
+                lines.append(f"  - {item.quantity}x {item.product.name} — {item.subtotal:.2f}€ ({item.product.price:.2f}€/u)")
+            lines.append(f"\n**Total : {superu_cart.total:.2f}€** ({superu_cart.item_count} article(s))")
+            return "\n".join(lines)
+
+        elif name == "superu__remove_from_cart":
+            before = superu_cart.item_count
+            superu_cart.remove_item(args["product_id"])
+            if superu_cart.item_count < before:
+                return f"Produit retiré. Total: {superu_cart.total:.2f}€"
+            return "Produit non trouvé dans le panier."
+
+        # ── Picard ───────────────────────────────────────────────────────
+        elif name == "picard__search_products":
+            results = picard_client.search_products(
+                query=args["query"],
+                max_results=min(args.get("max_results", 10), 40),
+                sort_by=args.get("sort_by", "relevance"),
+                nutriscore_filter=args.get("nutriscore_filter"),
+            )
+            if not results:
+                return "Aucun produit trouvé pour cette recherche."
+            lines = [f"**{len(results)} produit(s) pour \"{args['query']}\"**\n"]
+            lines += [_fmt_picard_product(i, p) for i, p in enumerate(results, 1)]
+            return "\n".join(lines)
+
+        elif name == "picard__get_product_details":
+            product = picard_client.get_product_details(args["product_id"])
+            if not product:
+                return "Produit introuvable."
+            return json.dumps(product, indent=2, ensure_ascii=False)
+
+        elif name == "picard__browse_category":
+            results = picard_client.browse_category(
+                category=args["category"],
+                sort_by=args.get("sort_by", "relevance"),
+                nutriscore_filter=args.get("nutriscore_filter"),
+                max_results=min(args.get("max_results", 20), 48),
+            )
+            if not results:
+                cats = ", ".join(picard_client.available_categories())
+                return f"Aucun produit pour « {args['category']} ».\nCatégories disponibles : {cats}"
+            lines = [f"**{len(results)} produit(s) — rayon « {args['category']} »**\n"]
+            lines += [_fmt_picard_product(i, p) for i, p in enumerate(results, 1)]
+            return "\n".join(lines)
+
+        elif name == "picard__get_promotions":
+            results = picard_client.get_promotions(max_results=min(args.get("max_results", 20), 48))
+            if not results:
+                return "Aucune promotion trouvée."
+            lines = [f"**{len(results)} produit(s) en promotion :**\n"]
+            lines += [_fmt_picard_product(i, p) for i, p in enumerate(results, 1)]
+            return "\n".join(lines)
+
+        elif name == "picard__compare_nutrition":
+            ids = args["product_ids"]
+            if not ids or len(ids) < 2:
+                return "Donne au moins 2 IDs produits à comparer."
+            data = picard_client.compare_nutrition(ids, args.get("sort_by_field", "proteines"))
+            if not data["products"]:
+                return "Aucune donnée nutritionnelle récupérée."
+            lines = [f"**Comparaison de {data['count']} produit(s) — tri par {data['sorted_by']} ({data['order']})** (valeurs /100 g)\n"]
+            for i, r in enumerate(data["products"], 1):
+                ns = f" | Nutri {r['nutriscore']}" if r.get("nutriscore") else ""
+                ppk = f" | {r['price_per_kg']}" if r.get("price_per_kg") else ""
+                lien = f"\n   Lien: {r['url']}" if r.get("url") else ""
+                lines.append(
+                    f"{i}. **{r['name']}** (ID {r['id']}){ns}{ppk}\n"
+                    f"   kcal: {r.get('kcal_100g')} | protéines: {r.get('proteins_100g')}g | "
+                    f"glucides: {r.get('carbs_100g')}g | lipides: {r.get('fats_100g')}g | "
+                    f"fibres: {r.get('fibers_100g')}g | sel: {r.get('salt_100g')}g{lien}\n"
+                )
+            return "\n".join(lines)
+
+        elif name == "picard__find_stores":
+            stores = picard_client.find_stores(postal_code=args["postal_code"])
+            if not stores:
+                return f"Pas de magasin trouvé pour « {args['postal_code']} ».\nFinder officiel : https://www.picard.fr/picard-a-votre-service/magasins/"
+            lines = [f"**{len(stores)} magasin(s) près de {args['postal_code']} :**\n"]
+            for s in stores:
+                addr = f"\n  {s['address']}" if s.get("address") else ""
+                lines.append(f"- **{s['name']}**{addr}")
+            return "\n".join(lines)
+
+        elif name == "picard__add_to_cart":
+            added = []
+            for item in args["items"]:
+                product = PicardProduct(id=item["product_id"], name=item["name"], price=item["price"])
+                picard_cart.add_item(product, item.get("quantity", 1))
+                added.append(f"  - {item.get('quantity', 1)}x {item['name']} ({item['price']:.2f}€)")
+            return f"**Produit(s) ajouté(s) :**\n" + "\n".join(added) + f"\n\n**Total : {picard_cart.total:.2f}€** ({picard_cart.item_count} article(s))"
+
+        elif name == "picard__view_cart":
+            if not picard_cart.items:
+                return "Le panier Picard est vide."
+            lines = ["**Panier Picard :**\n"]
+            for item in picard_cart.items:
+                lines.append(f"  - {item.quantity}x {item.product.name} — {item.subtotal:.2f}€ ({item.product.price:.2f}€/u)")
+            lines.append(f"\n**Total : {picard_cart.total:.2f}€** ({picard_cart.item_count} article(s))")
+            return "\n".join(lines)
+
+        elif name == "picard__remove_from_cart":
+            before = picard_cart.item_count
+            picard_cart.remove_item(args["product_id"])
+            if picard_cart.item_count < before:
+                return f"Produit retiré. Total: {picard_cart.total:.2f}€"
+            return "Produit non trouvé dans le panier."
+
+        else:
+            return f"Outil inconnu : {name}"
+
+    except Exception as e:
+        return f"Erreur : {e}"
+
+
+# ── Prompts ──────────────────────────────────────────────────────────────────
 
 def _parse_store_text(text: str) -> list[dict]:
     stores = []
@@ -76,24 +368,22 @@ def _parse_store_text(text: str) -> list[dict]:
 def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: bool) -> str:
     if use_superu and use_picard:
         scope = (
-            "Tu disposes d'outils MCP préfixés `superu__` (Super U Drive) et "
+            "Tu disposes d'outils préfixés `superu__` (Super U Drive) et "
             "`picard__` (Picard, surgelés). Choisis l'enseigne pertinente selon la "
             "question, ou interroge les deux pour comparer."
         )
     elif use_superu:
         scope = (
-            "Tu disposes uniquement des outils MCP `superu__` (Super U Drive). "
-            "Picard est désactivé pour cette session — n'en parle pas et ne tente "
-            "pas d'appeler d'outil `picard__`."
+            "Tu disposes uniquement des outils `superu__` (Super U Drive). "
+            "Picard est désactivé — n'en parle pas."
         )
     elif use_picard:
         scope = (
-            "Tu disposes uniquement des outils MCP `picard__` (Picard, surgelés). "
-            "Super U est désactivé pour cette session — n'en parle pas et ne tente "
-            "pas d'appeler d'outil `superu__`."
+            "Tu disposes uniquement des outils `picard__` (Picard, surgelés). "
+            "Super U est désactivé — n'en parle pas."
         )
     else:
-        scope = "Aucun connecteur MCP n'est actif : préviens l'utilisateur d'en activer un."
+        scope = "Aucun connecteur n'est actif : préviens l'utilisateur d'en activer un."
 
     base = (
         "Tu es un assistant de courses intelligent et conversationnel. "
@@ -101,7 +391,7 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         f"{scope}\n\n"
         "RÈGLES D'UTILISATION DES OUTILS :\n"
         "- Dès qu'une question mentionne un produit, un prix, une promo, une catégorie "
-        "ou une comparaison → appelle les outils MCP appropriés (search_products, "
+        "ou une comparaison → appelle les outils appropriés (search_products, "
         "compare_prices, get_promotions, etc.), préfixés du bon connecteur.\n"
         "- Ne dis JAMAIS que tu n'as pas accès aux outils ou que tu ne peux pas chercher.\n"
         "- Si une recherche ne donne rien, dis-le en une phrase.\n\n"
@@ -128,10 +418,11 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         "Dès qu'une question porte sur un prix, une comparaison, ou un produit "
         "Super U, vérifie SYSTÉMATIQUEMENT CHACUN de ces magasins : appelle "
         "`superu__set_store` avec le slug, puis `superu__search_products`, et répète "
-        "pour chaque magasin de la liste avant de répondre — ne te limite jamais à un "
-        "seul magasin si plusieurs sont sélectionnés."
+        "pour chaque magasin de la liste avant de répondre."
     )
 
+
+# ── Error helpers ────────────────────────────────────────────────────────────
 
 def _unwrap_exception(e: BaseException) -> str:
     if isinstance(e, BaseExceptionGroup):
@@ -172,36 +463,7 @@ def _call_with_retry(fn, retries: int = 3, base_delay: float = 2.0):
             time.sleep(base_delay * (2 ** attempt))
 
 
-def run_sync(coro):
-    box = {}
-
-    def worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            box["value"] = loop.run_until_complete(coro)
-        except Exception as e:
-            box["error"] = e
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=worker)
-    t.start()
-    t.join()
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
-
-
-async def fetch_superu_stores(postal_code: str) -> list[dict]:
-    params = SERVERS["superu"]
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool("find_stores", {"postal_code": postal_code})
-            raw = "\n".join(getattr(c, "text", "") for c in result.content).strip()
-    return _parse_store_text(raw)
-
+# ── Agent loop (synchrone, sans MCP) ────────────────────────────────────────
 
 def _assistant_to_dict(msg) -> dict:
     d = {"role": "assistant", "content": msg.content or ""}
@@ -217,89 +479,59 @@ def _assistant_to_dict(msg) -> dict:
     return d
 
 
-async def run_agent_tools(
-    history: list[dict], model: str, primary_slug: str = "", enabled: set[str] | None = None
-):
-    enabled = enabled if enabled is not None else set(SERVERS.keys())
-    active_servers = {k: v for k, v in SERVERS.items() if k in enabled}
+def run_agent_tools(history: list[dict], model: str, primary_slug: str = "", enabled: set[str] | None = None):
+    enabled = enabled or {"superu", "picard"}
+    tools_spec = []
+    if "superu" in enabled:
+        tools_spec += SUPERU_TOOLS
+    if "picard" in enabled:
+        tools_spec += PICARD_TOOLS
 
-    async with AsyncExitStack() as stack:
-        sessions: dict[str, ClientSession] = {}
-        tools_spec: list[dict] = []
-        routing: dict[str, tuple[str, str]] = {}
+    if primary_slug and "superu" in enabled:
+        try:
+            superu_client.set_store(primary_slug)
+        except Exception:
+            pass
 
-        for name, params in active_servers.items():
-            read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            sessions[name] = session
-            for tool in (await session.list_tools()).tools:
-                full = f"{name}__{tool.name}"
-                tools_spec.append({
-                    "type": "function",
-                    "function": {
-                        "name": full,
-                        "description": tool.description or "",
-                        "parameters": tool.inputSchema or {"type": "object", "properties": {}},
-                    },
-                })
-                routing[full] = (name, tool.name)
+    client = Mistral(api_key=API_KEY)
+    messages = list(history)
+    trace: list[dict] = []
 
-        if primary_slug and "superu" in sessions:
-            try:
-                await sessions["superu"].call_tool("set_store", {"store": primary_slug})
-            except Exception:
-                pass
-
-        client = Mistral(api_key=API_KEY)
-        messages = list(history)
-        trace: list[dict] = []
-
-        for _ in range(MAX_ROUNDS):
-            resp = await asyncio.to_thread(
-                lambda: _call_with_retry(
-                    lambda: client.chat.complete(
-                        model=model,
-                        messages=messages,
-                        tools=tools_spec,
-                        tool_choice="auto",
-                        temperature=TEMPERATURE,
-                    )
-                )
+    for _ in range(MAX_ROUNDS):
+        resp = _call_with_retry(
+            lambda: client.chat.complete(
+                model=model,
+                messages=messages,
+                tools=tools_spec,
+                tool_choice="auto",
+                temperature=TEMPERATURE,
             )
-            msg = resp.choices[0].message
+        )
+        msg = resp.choices[0].message
 
-            if not msg.tool_calls:
-                break
+        if not msg.tool_calls:
+            break
 
-            messages.append(_assistant_to_dict(msg))
+        messages.append(_assistant_to_dict(msg))
 
-            for tc in msg.tool_calls:
-                server_tool = routing.get(tc.function.name)
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                if server_tool is None:
-                    content = f"Outil inconnu : {tc.function.name}"
-                else:
-                    server, tool_name = server_tool
-                    result = await sessions[server].call_tool(tool_name, args)
-                    content = "\n".join(
-                        getattr(c, "text", "") for c in result.content
-                    ).strip() or "(réponse vide)"
-                trace.append({"tool": tc.function.name, "args": args, "result": content})
-                messages.append({
-                    "role": "tool",
-                    "name": tc.function.name,
-                    "tool_call_id": tc.id,
-                    "content": content,
-                })
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            content = handle_tool(tc.function.name, args)
+            trace.append({"tool": tc.function.name, "args": args, "result": content})
+            messages.append({
+                "role": "tool",
+                "name": tc.function.name,
+                "tool_call_id": tc.id,
+                "content": content,
+            })
 
-        return messages, trace
+    return messages, trace
 
 
-# --------------------------------------------------------------------------- UI
+# ── UI ───────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Courses MCP — Super U × Picard", page_icon="🛒")
 st.title("🛒 Chatbot Courses — Super U × Picard")
@@ -326,13 +558,7 @@ with st.sidebar:
 
     if use_superu:
         st.subheader("🏪 Magasins Super U")
-
-        postal_input = st.text_input(
-            "Code postal",
-            placeholder="Ex : 69007",
-            label_visibility="collapsed",
-        )
-
+        postal_input = st.text_input("Code postal", placeholder="Ex : 69007", label_visibility="collapsed")
         if st.button("🔍 Rechercher", use_container_width=True):
             cp = postal_input.strip()
             if not re.match(r"^\d{5}$", cp):
@@ -340,8 +566,16 @@ with st.sidebar:
             else:
                 with st.spinner("Recherche…"):
                     try:
-                        st.session_state.found_stores = run_sync(fetch_superu_stores(cp))
-                        if not st.session_state.found_stores:
+                        result = superu_client.find_stores(postal_code=cp)
+                        found_stores = []
+                        for s in result:
+                            found_stores.append({
+                                "name": s.get("name", ""),
+                                "address": s.get("address", ""),
+                                "slug": s.get("drive_slug", ""),
+                            })
+                        st.session_state.found_stores = found_stores
+                        if not found_stores:
                             st.warning("Aucun magasin trouvé.")
                     except Exception as e:
                         st.error(f"Erreur : {e}")
@@ -379,7 +613,6 @@ with st.sidebar:
                     if st.button("✕", key=f"rm_{i}"):
                         st.session_state.selected_stores.pop(i)
                         st.rerun()
-
         st.divider()
     else:
         selected = st.session_state.selected_stores
@@ -396,10 +629,7 @@ with st.sidebar:
         st.rerun()
 
 selected = st.session_state.selected_stores
-system_msg = {
-    "role": "system",
-    "content": _build_system_prompt(selected, use_superu, use_picard),
-}
+system_msg = {"role": "system", "content": _build_system_prompt(selected, use_superu, use_picard)}
 
 if "history" not in st.session_state:
     st.session_state.history = [system_msg]
@@ -433,11 +663,10 @@ if prompt:
     thinking_label = random.choice(THINKING_VERBS)
 
     with st.chat_message("assistant"):
-
         with st.spinner(thinking_label):
             try:
-                messages_ready, trace = run_sync(
-                    run_agent_tools(st.session_state.history, model, primary_slug, enabled_servers)
+                messages_ready, trace = run_agent_tools(
+                    st.session_state.history, model, primary_slug, enabled_servers
                 )
             except Exception as e:
                 _render_error(e)
@@ -446,9 +675,7 @@ if prompt:
         if trace:
             with st.expander(f"🔧 {len(trace)} appel(s) MCP", expanded=False):
                 for t in trace:
-                    st.markdown(
-                        f"**`{t['tool']}`** · `{json.dumps(t['args'], ensure_ascii=False)}`"
-                    )
+                    st.markdown(f"**`{t['tool']}`** · `{json.dumps(t['args'], ensure_ascii=False)}`")
                     st.code(t["result"][:2000])
 
         mistral_client = Mistral(api_key=API_KEY)
