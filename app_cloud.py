@@ -4,7 +4,6 @@ import json
 import os
 import random
 import re
-import sys
 import time
 import uuid
 
@@ -18,24 +17,12 @@ import streamlit as st
 from mistralai import Mistral
 from mistralai.models import SDKError
 
-# ── Import submodules (each has its own `src` package — load one at a time) ──
-
-def _load_submodule(subdir, client_cls_name):
-    path = os.path.join(APP_DIR, subdir)
-    sys.path.insert(0, path)
-    for key in [k for k in sys.modules if k == "src" or k.startswith("src.")]:
-        del sys.modules[key]
-    import importlib
-    client_mod = importlib.import_module("src.api.client")
-    models_mod = importlib.import_module("src.api.models")
-    cls = getattr(client_mod, client_cls_name)
-    cart_cls = models_mod.Cart
-    product_cls = models_mod.Product
-    sys.path.remove(path)
-    return cls, cart_cls, product_cls
-
-PicardClient, PicardCart, PicardProduct = _load_submodule("mcp-picard", "PicardClient")
-SuperUClient, SuperUCart, SuperUProduct = _load_submodule("mcp-superu", "SuperUClient")
+from picard.client import PicardClient
+from picard.models import Cart as PicardCart
+from picard.models import Product as PicardProduct
+from superu.client import SuperUClient
+from superu.models import Cart as SuperUCart
+from superu.models import Product as SuperUProduct
 
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 MAX_STORES = 7
@@ -59,14 +46,14 @@ THINKING_VERBS = [
 
 # ── Config Super U ───────────────────────────────────────────────────────────
 
-_superu_config_path = os.path.join(APP_DIR, "mcp-superu", "config", "config.json")
+_superu_config_path = os.path.join(APP_DIR, "superu", "config", "config.json")
 try:
     with open(_superu_config_path, encoding="utf-8") as f:
         _superu_config = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
     _superu_config = {}
 
-_picard_config_path = os.path.join(APP_DIR, "mcp-picard", "config", "config.json")
+_picard_config_path = os.path.join(APP_DIR, "picard", "config", "config.json")
 try:
     with open(_picard_config_path, encoding="utf-8") as f:
         _picard_config = json.load(f)

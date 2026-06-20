@@ -1,0 +1,11 @@
+{
+  "store": "stlouis",
+  "stores": {
+    "bonnel":  { "name": "U Express - Lyon Bonnel",     "slug": "uexpress-lyon3bonnel",     "address": "169 rue Vendôme, 69003 Lyon" },
+    "gerland": { "name": "Super U - Lyon Gerland",       "slug": "superu-lyongerland",       "address": "113 boulevard Yves Farge, 69007 Lyon" },
+    "stlouis": { "name": "U Express - Lyon St Louis",    "slug": "uexpress-lyonsaintlouis",  "address": "52 rue de la Thibaudière, 69007 Lyon" },
+    "villars": { "name": "Super U - Villars-les-Dombes", "slug": "superu-villarslesdombes",  "address": "ZAC de la Tuilerie, RN 83, 01330 Villars-les-Dombes" }
+  },
+  "cache_ttl_minutes": 30,
+  "language": "fr"
+}
