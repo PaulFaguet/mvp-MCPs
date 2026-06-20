@@ -21,11 +21,19 @@ from mistralai.models import SDKError
 
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 
-HOME = os.path.expanduser("~")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SERVERS = {
-    "superu": StdioServerParameters(command="/bin/bash", args=[f"{HOME}/mcp-superu/run.sh"]),
-    "picard": StdioServerParameters(command="/bin/bash", args=[f"{HOME}/mcp-picard/run.sh"]),
+    "superu": StdioServerParameters(
+        command="python3", args=["-m", "src.server"],
+        env={**os.environ, "PYTHONPATH": os.path.join(APP_DIR, "mcp-superu")},
+        cwd=os.path.join(APP_DIR, "mcp-superu"),
+    ),
+    "picard": StdioServerParameters(
+        command="python3", args=["-m", "src.server"],
+        env={**os.environ, "PYTHONPATH": os.path.join(APP_DIR, "mcp-picard")},
+        cwd=os.path.join(APP_DIR, "mcp-picard"),
+    ),
 }
 
 MAX_STORES = 7

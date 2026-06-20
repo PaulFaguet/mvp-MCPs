@@ -1,0 +1,6 @@
+[submodule "mcp-superu"]
+	path = mcp-superu
+	url = https://github.com/PaulFaguet/mcp-superU.git
+[submodule "mcp-picard"]
+	path = mcp-picard
+	url = https://github.com/PaulFaguet/mcp-picard.git
