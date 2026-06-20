@@ -13,22 +13,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(APP_DIR, "mcp-superu"))
-sys.path.insert(0, os.path.join(APP_DIR, "mcp-picard"))
 
 import streamlit as st
 from mistralai import Mistral
 from mistralai.models import SDKError
 
-from src.api.client import PicardClient
-from src.api.models import Cart as PicardCart
-from src.api.models import Product as PicardProduct
+# ── Import submodules (each has its own `src` package — load one at a time) ──
 
-sys.path.remove(os.path.join(APP_DIR, "mcp-picard"))
+def _load_submodule(subdir, client_cls_name):
+    path = os.path.join(APP_DIR, subdir)
+    sys.path.insert(0, path)
+    for key in [k for k in sys.modules if k == "src" or k.startswith("src.")]:
+        del sys.modules[key]
+    import importlib
+    client_mod = importlib.import_module("src.api.client")
+    models_mod = importlib.import_module("src.api.models")
+    cls = getattr(client_mod, client_cls_name)
+    cart_cls = models_mod.Cart
+    product_cls = models_mod.Product
+    sys.path.remove(path)
+    return cls, cart_cls, product_cls
 
-from src.api.client import SuperUClient
-from src.api.models import Cart as SuperUCart
-from src.api.models import Product as SuperUProduct
+PicardClient, PicardCart, PicardProduct = _load_submodule("mcp-picard", "PicardClient")
+SuperUClient, SuperUCart, SuperUProduct = _load_submodule("mcp-superu", "SuperUClient")
 
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 MAX_STORES = 7
