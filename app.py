@@ -26,6 +26,16 @@ HOME = os.path.expanduser("~")
 SERVERS = {
     "superu": StdioServerParameters(command="/bin/bash", args=[f"{HOME}/mcp-superu/run.sh"]),
     "picard": StdioServerParameters(command="/bin/bash", args=[f"{HOME}/mcp-picard/run.sh"]),
+    "openfoodfacts": StdioServerParameters(command="/bin/bash", args=[f"{HOME}/mcp-openfoodfacts/run.sh"]),
+}
+
+CONNECTOR_LABELS = {
+    "superu": "`superu__` (Super U Drive — prix réels par magasin)",
+    "picard": "`picard__` (Picard — surgelés, prix national)",
+    "openfoodfacts": (
+        "`openfoodfacts__` (Open Food Facts — nutrition, Nutri-Score, NOVA, "
+        "additifs, allergènes par code-barres/EAN)"
+    ),
 }
 
 MAX_STORES = 7
@@ -67,27 +77,23 @@ def _parse_store_text(text: str) -> list[dict]:
     return stores
 
 
-def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: bool) -> str:
-    if use_superu and use_picard:
+def _build_system_prompt(selected: list[dict], enabled: set[str]) -> str:
+    active = [CONNECTOR_LABELS[k] for k in CONNECTOR_LABELS if k in enabled]
+    if not active:
+        scope = "Aucun connecteur MCP n'est actif : préviens l'utilisateur d'en activer un."
+    elif len(active) == 1:
         scope = (
-            "Tu disposes d'outils MCP préfixés `superu__` (Super U Drive) et "
-            "`picard__` (Picard, surgelés). Choisis l'enseigne pertinente selon la "
-            "question, ou interroge les deux pour comparer."
-        )
-    elif use_superu:
-        scope = (
-            "Tu disposes uniquement des outils MCP `superu__` (Super U Drive). "
-            "Picard est désactivé pour cette session — n'en parle pas et ne tente "
-            "pas d'appeler d'outil `picard__`."
-        )
-    elif use_picard:
-        scope = (
-            "Tu disposes uniquement des outils MCP `picard__` (Picard, surgelés). "
-            "Super U est désactivé pour cette session — n'en parle pas et ne tente "
-            "pas d'appeler d'outil `superu__`."
+            f"Tu disposes uniquement des outils MCP {active[0]}. "
+            "N'utilise et n'évoque aucun autre connecteur."
         )
     else:
-        scope = "Aucun connecteur MCP n'est actif : préviens l'utilisateur d'en activer un."
+        scope = (
+            "Tu disposes d'outils MCP : " + " ; ".join(active) + ". "
+            "Choisis le ou les connecteurs pertinents selon la question. Tu peux "
+            "croiser les sources — ex: récupérer l'EAN d'un produit via `superu__` "
+            "ou `picard__`, puis le passer à `openfoodfacts__get_product` pour le "
+            "détail nutritionnel (Nutri-Score, NOVA, additifs)."
+        )
 
     base = (
         "Tu es un assistant de courses intelligent et conversationnel. "
@@ -96,7 +102,10 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         "RÈGLES D'UTILISATION DES OUTILS :\n"
         "- Dès qu'une question mentionne un produit, un prix, une promo, une catégorie "
         "ou une comparaison → appelle les outils MCP appropriés (search_products, "
-        "compare_prices, get_promotions, etc.), préfixés du bon connecteur.\n"
+        "compare_prices, get_promotions, get_product, etc.), préfixés du bon connecteur.\n"
+        "- Pour une question de nutrition/santé/composition d'un produit (Nutri-Score, "
+        "additifs, allergènes, ultra-transformation) → utilise `openfoodfacts__` "
+        "(par code-barres/EAN, ou via search_products pour trouver l'EAN).\n"
         "- Ne dis JAMAIS que tu n'as pas accès aux outils ou que tu ne peux pas chercher.\n"
         "- Si une recherche ne donne rien, dis-le en une phrase.\n\n"
         "CONVERSATION :\n"
@@ -113,7 +122,7 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         "- Quand un résultat d'outil contient un champ 'Lien' ou 'url', inclus-le "
         "sous forme de lien markdown : [Nom du produit](url) — jamais d'URL brute."
     )
-    if not (use_superu and selected):
+    if not ("superu" in enabled and selected):
         return base
     store_lines = "\n".join(f"  - {s['name']} (slug: `{s['slug']}`)" for s in selected)
     return (
@@ -318,13 +327,19 @@ with st.sidebar:
 
     # ── Connecteurs MCP ──
     st.subheader("🔌 Connecteurs")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         use_superu = st.toggle("Super U", value=st.session_state.get("use_superu", True))
     with c2:
         use_picard = st.toggle("Picard", value=st.session_state.get("use_picard", True))
+    with c3:
+        use_off = st.toggle("Nutri (OFF)", value=st.session_state.get("use_off", True))
     st.session_state.use_superu = use_superu
     st.session_state.use_picard = use_picard
+    st.session_state.use_off = use_off
+    enabled_servers = {
+        n for n, on in (("superu", use_superu), ("picard", use_picard), ("openfoodfacts", use_off)) if on
+    }
 
     st.divider()
 
@@ -396,17 +411,17 @@ with st.sidebar:
 
     if st.button("🗑️ Réinitialiser la conversation", use_container_width=True):
         st.session_state.history = [
-            {"role": "system", "content": _build_system_prompt(selected, use_superu, use_picard)}
+            {"role": "system", "content": _build_system_prompt(selected, enabled_servers)}
         ]
         st.rerun()
 
-    st.caption("Serveurs MCP : `~/mcp-superu/run.sh` · `~/mcp-picard/run.sh`")
+    st.caption("Serveurs MCP : Super U · Picard · Open Food Facts")
 
 # ── Historique ────────────────────────────────────────────────────────────────
 selected = st.session_state.selected_stores
 system_msg = {
     "role": "system",
-    "content": _build_system_prompt(selected, use_superu, use_picard),
+    "content": _build_system_prompt(selected, enabled_servers),
 }
 
 if "history" not in st.session_state:
@@ -429,15 +444,14 @@ if prompt:
     if not API_KEY:
         st.error("Variable MISTRAL_API_KEY non définie.")
         st.stop()
-    if not use_superu and not use_picard:
-        st.error("Active au moins un connecteur (Super U ou Picard) dans la barre latérale.")
+    if not enabled_servers:
+        st.error("Active au moins un connecteur dans la barre latérale.")
         st.stop()
 
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    enabled_servers = {n for n, on in (("superu", use_superu), ("picard", use_picard)) if on}
     primary_slug = selected[0]["slug"] if (use_superu and selected) else ""
     thinking_label = random.choice(THINKING_VERBS)
 

@@ -1,23 +1,25 @@
-# MVP — Chatbot Courses (Super U × Picard)
+# MVP — Chatbot Courses (Super U × Picard × Open Food Facts)
 
-Chatbot Streamlit connecté à **Mistral AI** et aux serveurs **MCP Super U & Picard**.
-Discutez en langage naturel : le LLM appelle les outils MCP pour ramener des données
-réelles (prix, nutriscore, valeurs nutritionnelles, promos, panier).
+Chatbot Streamlit connecté à **Mistral AI** et à 3 serveurs **MCP : Super U, Picard
+et Open Food Facts**. Discutez en langage naturel : le LLM appelle les outils MCP
+pour ramener des données réelles (prix, nutriscore, nutrition, additifs, promos, panier).
 
 ## Fonctionnalités
 
 - Recherche de produits avec prix réels (Super U par magasin, Picard national)
 - Comparaison de prix entre magasins Super U
-- Nutriscore, valeurs nutritionnelles, promotions
+- Profil nutritionnel détaillé via Open Food Facts (Nutri-Score, NOVA, additifs,
+  allergènes) par code-barres — couplable à l'EAN des produits Super U / Picard
 - Panier de courses local
 - Streaming des réponses
-- Multi-enseigne : Super U et/ou Picard activables indépendamment
+- Multi-source : 3 connecteurs activables indépendamment
 - Liens directs vers les fiches produits
 
 ## Prérequis
 
 - Python 3.11+
-- Les deux serveurs MCP : [`mcp-superu`](https://github.com/PaulFaguet/mcp-superU) et [`mcp-picard`](https://github.com/PaulFaguet/mcp-picard)
+- Les serveurs MCP : [`mcp-superu`](https://github.com/PaulFaguet/mcp-superU),
+  [`mcp-picard`](https://github.com/PaulFaguet/mcp-picard) et `mcp-openfoodfacts`
 - Une clé API [Mistral](https://console.mistral.ai/)
 
 ## Installation
@@ -44,13 +46,14 @@ echo "MISTRAL_API_KEY=ta_cle" > .env
 Compare le prix du saumon fumé entre Picard et Super U
 Cherche du quinoa chez Picard, du moins cher au plus cher
 Classe 3 plats cuisinés Picard par protéines
-Quelles promos sur les desserts cette semaine ?
+Scanne le 3017620422003 et dis-moi si c'est sain
+C'est quoi le Nutri-Score et les additifs de ce produit ?
 ```
 
 ## Comment ça marche
 
 1. À chaque message, l'app lance les serveurs MCP en stdio et récupère leurs outils.
-2. Les outils sont exposés à Mistral, namespacés `superu__…` / `picard__…`.
+2. Les outils sont exposés à Mistral, namespacés `superu__…` / `picard__…` / `openfoodfacts__…`.
 3. Mistral décide quels outils appeler ; l'app exécute les appels MCP et renvoie les
    résultats au modèle, en boucle (max 6 tours), jusqu'à la réponse finale.
 4. La réponse est streamée en temps réel.

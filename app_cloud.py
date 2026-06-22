@@ -23,6 +23,7 @@ from picard.models import Product as PicardProduct
 from superu.client import SuperUClient
 from superu.models import Cart as SuperUCart
 from superu.models import Product as SuperUProduct
+from openfoodfacts.client import OpenFoodFactsClient
 
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 MAX_STORES = 7
@@ -60,6 +61,13 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     _picard_config = {}
 
+_off_config_path = os.path.join(APP_DIR, "openfoodfacts", "config", "config.json")
+try:
+    with open(_off_config_path, encoding="utf-8") as f:
+        _off_config = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    _off_config = {}
+
 superu_client = SuperUClient(
     store_slug=_superu_config.get("store", _superu_config.get("store_slug", "puteaux")),
     stores=_superu_config.get("stores"),
@@ -68,6 +76,11 @@ superu_client = SuperUClient(
 picard_client = PicardClient(
     cache_ttl_minutes=_picard_config.get("cache_ttl_minutes", 30),
     request_delay=_picard_config.get("request_delay_seconds", 1.0),
+)
+off_client = OpenFoodFactsClient(
+    cache_ttl_minutes=_off_config.get("cache_ttl_minutes", 1440),
+    request_delay=_off_config.get("request_delay_seconds", 1.0),
+    country=_off_config.get("country", "world"),
 )
 superu_cart = SuperUCart(id=str(uuid.uuid4()))
 picard_cart = PicardCart(id=str(uuid.uuid4()))
@@ -100,6 +113,12 @@ PICARD_TOOLS = [
     {"type": "function", "function": {"name": "picard__remove_from_cart", "description": "Retirer un produit du panier Picard.", "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}},
 ]
 
+OFF_TOOLS = [
+    {"type": "function", "function": {"name": "openfoodfacts__get_product", "description": "Fiche complète Open Food Facts par code-barres (EAN) : Nutri-Score, NOVA (degré de transformation), Eco-Score, nutrition /100 g, additifs, allergènes, ingrédients, labels. Idéal après un scan ou avec l'EAN d'un produit Super U / Picard.", "parameters": {"type": "object", "properties": {"barcode": {"type": "string", "description": "Code-barres / EAN (ex: '3017620422003')"}}, "required": ["barcode"]}}},
+    {"type": "function", "function": {"name": "openfoodfacts__search_products", "description": "Rechercher des produits Open Food Facts par nom ou marque (nom, marque, EAN, Nutri-Score, NOVA). Utiliser l'EAN retourné avec get_product pour la fiche détaillée.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "default": 10}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "openfoodfacts__compare_products", "description": "Comparer plusieurs produits (par code-barres) sur leurs valeurs nutritionnelles ou leur Nutri-Score. Donner les EAN.", "parameters": {"type": "object", "properties": {"barcodes": {"type": "array", "items": {"type": "string"}}, "sort_by_field": {"type": "string", "enum": ["nutriscore", "proteines", "kcal", "fibres", "lipides", "glucides", "sucres", "sel"], "default": "nutriscore"}}, "required": ["barcodes"]}}},
+]
+
 
 # ── Tool handlers ────────────────────────────────────────────────────────────
 
@@ -127,6 +146,65 @@ def _fmt_picard_product(i: int, p: dict) -> str:
         f"{i}. **{p['name']}**{fmt}\n"
         f"   Prix: {price_str}{ns}{ps}{note} | ID: {p['id']}{promo}{lien}\n"
     )
+
+
+NOVA_LABELS = {
+    1: "non/peu transformé",
+    2: "ingrédient culinaire transformé",
+    3: "aliment transformé",
+    4: "ultra-transformé",
+}
+
+
+def _fmt_off_levels(levels: dict) -> str:
+    if not levels:
+        return ""
+    fr = {"fat": "gras", "saturated-fat": "AG saturés", "sugars": "sucres", "salt": "sel"}
+    tr = {"low": "faible", "moderate": "modéré", "high": "élevé"}
+    return " | ".join(f"{fr.get(k, k)}: {tr.get(v, v)}" for k, v in levels.items())
+
+
+def _fmt_off_nutrition(n: dict | None) -> str:
+    if not n:
+        return "Valeurs nutritionnelles non disponibles."
+    return (
+        f"   kcal: {n.get('kcal_100g')} | protéines: {n.get('proteins_100g')}g | "
+        f"glucides: {n.get('carbs_100g')}g (sucres: {n.get('sugars_100g')}g) | "
+        f"lipides: {n.get('fats_100g')}g (saturés: {n.get('saturated_fats_100g')}g) | "
+        f"fibres: {n.get('fibers_100g')}g | sel: {n.get('salt_100g')}g"
+    )
+
+
+def _fmt_off_product_full(p: dict) -> str:
+    lines = [f"**{p['name'] or 'Produit sans nom'}**"]
+    meta = [x for x in (p.get("brands"), p.get("quantity")) if x]
+    meta.append(f"EAN: {p['code']}")
+    lines.append(" — ".join(meta))
+    scores = []
+    if p.get("nutriscore"):
+        scores.append(f"Nutri-Score: **{p['nutriscore']}**")
+    if p.get("nova_group"):
+        scores.append(f"NOVA: **{p['nova_group']}** ({NOVA_LABELS.get(p['nova_group'], '')})")
+    if p.get("ecoscore"):
+        scores.append(f"Eco-Score: **{p['ecoscore']}**")
+    if scores:
+        lines.append(" | ".join(scores))
+    lines.append("\nValeurs nutritionnelles (/100 g) :")
+    lines.append(_fmt_off_nutrition(p.get("nutrition")))
+    levels = _fmt_off_levels(p.get("nutrient_levels"))
+    if levels:
+        lines.append(f"\nRepères : {levels}")
+    if p.get("additives"):
+        lines.append(f"\nAdditifs ({len(p['additives'])}) : {', '.join(p['additives'])}")
+    if p.get("allergens"):
+        lines.append(f"Allergènes : {', '.join(p['allergens'])}")
+    if p.get("labels"):
+        lines.append(f"Labels : {p['labels']}")
+    if p.get("ingredients_text"):
+        lines.append(f"\nIngrédients : {p['ingredients_text'][:800]}")
+    if p.get("url"):
+        lines.append(f"\nLien: {p['url']}")
+    return "\n".join(lines)
 
 
 def handle_tool(name: str, args: dict) -> str:
@@ -333,6 +411,55 @@ def handle_tool(name: str, args: dict) -> str:
                 return f"Produit retiré. Total: {picard_cart.total:.2f}€"
             return "Produit non trouvé dans le panier."
 
+        # ── Open Food Facts ──────────────────────────────────────────────
+        elif name == "openfoodfacts__get_product":
+            product = off_client.get_product(args["barcode"])
+            if not product:
+                return f"Produit introuvable pour le code-barres « {args['barcode']} » dans Open Food Facts."
+            return _fmt_off_product_full(product)
+
+        elif name == "openfoodfacts__search_products":
+            results = off_client.search_products(
+                query=args["query"],
+                max_results=min(args.get("max_results", 10), 40),
+            )
+            if not results:
+                return "Aucun produit trouvé pour cette recherche."
+            lines = [f"**{len(results)} produit(s) pour \"{args['query']}\"**\n"]
+            for i, p in enumerate(results, 1):
+                ns = f" | Nutri: {p['nutriscore']}" if p.get("nutriscore") else ""
+                nova = f" | NOVA: {p['nova_group']}" if p.get("nova_group") else ""
+                brand = f" — {p['brands']}" if p.get("brands") else ""
+                lien = f"\n   Lien: {p['url']}" if p.get("url") else ""
+                lines.append(
+                    f"{i}. **{p['name'] or 'Sans nom'}**{brand}\n"
+                    f"   EAN: {p['code']}{ns}{nova}{lien}\n"
+                )
+            return "\n".join(lines)
+
+        elif name == "openfoodfacts__compare_products":
+            codes = args["barcodes"]
+            if not codes or len(codes) < 2:
+                return "Donne au moins 2 codes-barres à comparer."
+            data = off_client.compare_products(codes, args.get("sort_by_field", "nutriscore"))
+            if not data["products"]:
+                return "Aucun produit récupéré pour ces codes-barres."
+            lines = [
+                f"**Comparaison de {data['count']} produit(s) — tri par {data['sorted_by']} "
+                f"({data['order']})** (valeurs /100 g)\n"
+            ]
+            for i, r in enumerate(data["products"], 1):
+                ns = f" | Nutri {r['nutriscore']}" if r.get("nutriscore") else ""
+                nova = f" | NOVA {r['nova_group']}" if r.get("nova_group") else ""
+                lien = f"\n   Lien: {r['url']}" if r.get("url") else ""
+                lines.append(
+                    f"{i}. **{r['name']}** (EAN {r['code']}){ns}{nova}\n"
+                    f"   kcal: {r.get('kcal_100g')} | protéines: {r.get('proteins_100g')}g | "
+                    f"glucides: {r.get('carbs_100g')}g | lipides: {r.get('fats_100g')}g | "
+                    f"fibres: {r.get('fibers_100g')}g | sel: {r.get('salt_100g')}g{lien}\n"
+                )
+            return "\n".join(lines)
+
         else:
             return f"Outil inconnu : {name}"
 
@@ -359,25 +486,33 @@ def _parse_store_text(text: str) -> list[dict]:
     return stores
 
 
-def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: bool) -> str:
-    if use_superu and use_picard:
+CONNECTOR_LABELS = {
+    "superu": "`superu__` (Super U Drive — prix réels par magasin)",
+    "picard": "`picard__` (Picard — surgelés, prix national)",
+    "openfoodfacts": (
+        "`openfoodfacts__` (Open Food Facts — nutrition, Nutri-Score, NOVA, "
+        "additifs, allergènes par code-barres/EAN)"
+    ),
+}
+
+
+def _build_system_prompt(selected: list[dict], enabled: set[str]) -> str:
+    active = [CONNECTOR_LABELS[k] for k in CONNECTOR_LABELS if k in enabled]
+    if not active:
+        scope = "Aucun connecteur n'est actif : préviens l'utilisateur d'en activer un."
+    elif len(active) == 1:
         scope = (
-            "Tu disposes d'outils préfixés `superu__` (Super U Drive) et "
-            "`picard__` (Picard, surgelés). Choisis l'enseigne pertinente selon la "
-            "question, ou interroge les deux pour comparer."
-        )
-    elif use_superu:
-        scope = (
-            "Tu disposes uniquement des outils `superu__` (Super U Drive). "
-            "Picard est désactivé — n'en parle pas."
-        )
-    elif use_picard:
-        scope = (
-            "Tu disposes uniquement des outils `picard__` (Picard, surgelés). "
-            "Super U est désactivé — n'en parle pas."
+            f"Tu disposes uniquement des outils {active[0]}. "
+            "N'utilise et n'évoque aucun autre connecteur."
         )
     else:
-        scope = "Aucun connecteur n'est actif : préviens l'utilisateur d'en activer un."
+        scope = (
+            "Tu disposes des outils : " + " ; ".join(active) + ". "
+            "Choisis le ou les connecteurs pertinents selon la question. Tu peux "
+            "croiser les sources — ex: récupérer l'EAN d'un produit via `superu__` "
+            "ou `picard__`, puis le passer à `openfoodfacts__get_product` pour le "
+            "détail nutritionnel (Nutri-Score, NOVA, additifs)."
+        )
 
     base = (
         "Tu es un assistant de courses intelligent et conversationnel. "
@@ -386,7 +521,10 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         "RÈGLES D'UTILISATION DES OUTILS :\n"
         "- Dès qu'une question mentionne un produit, un prix, une promo, une catégorie "
         "ou une comparaison → appelle les outils appropriés (search_products, "
-        "compare_prices, get_promotions, etc.), préfixés du bon connecteur.\n"
+        "compare_prices, get_promotions, get_product, etc.), préfixés du bon connecteur.\n"
+        "- Pour une question de nutrition/santé/composition d'un produit (Nutri-Score, "
+        "additifs, allergènes, ultra-transformation) → utilise `openfoodfacts__` "
+        "(par code-barres/EAN, ou via search_products pour trouver l'EAN).\n"
         "- Ne dis JAMAIS que tu n'as pas accès aux outils ou que tu ne peux pas chercher.\n"
         "- Si une recherche ne donne rien, dis-le en une phrase.\n\n"
         "CONVERSATION :\n"
@@ -403,7 +541,7 @@ def _build_system_prompt(selected: list[dict], use_superu: bool, use_picard: boo
         "- Quand un résultat d'outil contient un champ 'Lien' ou 'url', inclus-le "
         "sous forme de lien markdown : [Nom du produit](url) — jamais d'URL brute."
     )
-    if not (use_superu and selected):
+    if not ("superu" in enabled and selected):
         return base
     store_lines = "\n".join(f"  - {s['name']} (slug: `{s['slug']}`)" for s in selected)
     return (
@@ -474,12 +612,14 @@ def _assistant_to_dict(msg) -> dict:
 
 
 def run_agent_tools(history: list[dict], model: str, primary_slug: str = "", enabled: set[str] | None = None):
-    enabled = enabled or {"superu", "picard"}
+    enabled = enabled or {"superu", "picard", "openfoodfacts"}
     tools_spec = []
     if "superu" in enabled:
         tools_spec += SUPERU_TOOLS
     if "picard" in enabled:
         tools_spec += PICARD_TOOLS
+    if "openfoodfacts" in enabled:
+        tools_spec += OFF_TOOLS
 
     if primary_slug and "superu" in enabled:
         try:
@@ -540,13 +680,19 @@ with st.sidebar:
     st.header("⚙️ Réglages")
 
     st.subheader("🔌 Connecteurs")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         use_superu = st.toggle("Super U", value=st.session_state.get("use_superu", True))
     with c2:
         use_picard = st.toggle("Picard", value=st.session_state.get("use_picard", True))
+    with c3:
+        use_off = st.toggle("Nutri (OFF)", value=st.session_state.get("use_off", True))
     st.session_state.use_superu = use_superu
     st.session_state.use_picard = use_picard
+    st.session_state.use_off = use_off
+    enabled_servers = {
+        n for n, on in (("superu", use_superu), ("picard", use_picard), ("openfoodfacts", use_off)) if on
+    }
 
     st.divider()
 
@@ -618,12 +764,12 @@ with st.sidebar:
 
     if st.button("🗑️ Réinitialiser la conversation", use_container_width=True):
         st.session_state.history = [
-            {"role": "system", "content": _build_system_prompt(selected, use_superu, use_picard)}
+            {"role": "system", "content": _build_system_prompt(selected, enabled_servers)}
         ]
         st.rerun()
 
 selected = st.session_state.selected_stores
-system_msg = {"role": "system", "content": _build_system_prompt(selected, use_superu, use_picard)}
+system_msg = {"role": "system", "content": _build_system_prompt(selected, enabled_servers)}
 
 if "history" not in st.session_state:
     st.session_state.history = [system_msg]
@@ -644,15 +790,14 @@ if prompt:
     if not API_KEY:
         st.error("Variable MISTRAL_API_KEY non définie.")
         st.stop()
-    if not use_superu and not use_picard:
-        st.error("Active au moins un connecteur (Super U ou Picard) dans la barre latérale.")
+    if not enabled_servers:
+        st.error("Active au moins un connecteur dans la barre latérale.")
         st.stop()
 
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    enabled_servers = {n for n, on in (("superu", use_superu), ("picard", use_picard)) if on}
     primary_slug = selected[0]["slug"] if (use_superu and selected) else ""
     thinking_label = random.choice(THINKING_VERBS)
 
