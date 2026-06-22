@@ -10,8 +10,6 @@ pour ramener des données réelles (prix, nutriscore, nutrition, additifs, promo
 - Comparaison de prix entre magasins Super U
 - Profil nutritionnel détaillé via Open Food Facts (Nutri-Score, NOVA, additifs,
   allergènes) par code-barres — couplable à l'EAN des produits Super U / Picard
-- **Scanner webcam** : prends en photo le code-barres d'un vrai produit → fiche
-  Open Food Facts automatique (décodage EAN-13 côté serveur via `zxing-cpp`)
 - Panier de courses local
 - Streaming des réponses
 - Multi-source : 3 connecteurs activables indépendamment

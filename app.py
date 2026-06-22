@@ -1,8 +1,6 @@
 """MVP — Chatbot Mistral branché sur les MCP Super U & Picard."""
 
 import asyncio
-import hashlib
-import io
 import json
 import os
 import random
@@ -20,14 +18,6 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mistralai import Mistral
 from mistralai.models import SDKError
-
-try:
-    import zxingcpp
-    from PIL import Image
-
-    _BARCODE_OK = True
-except ImportError:
-    _BARCODE_OK = False
 
 RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
 
@@ -66,54 +56,6 @@ THINKING_VERBS = [
     "Je vérifie le ticket de caisse…",
     "Je compare les prix au kilo…",
 ]
-
-
-# -------------------------------------------------------------- barcode scanner
-
-def _decode_barcode(img_bytes: bytes) -> str | None:
-    """Décode un code-barres (EAN-13, UPC…) depuis une image. None si rien trouvé."""
-    if not _BARCODE_OK:
-        return None
-    try:
-        img = Image.open(io.BytesIO(img_bytes))
-        for r in zxingcpp.read_barcodes(img):
-            if r.text and r.valid:
-                return r.text
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def render_scanner(use_off: bool) -> None:
-    """Affiche le module webcam : capture une photo, décode l'EAN, et injecte
-    une question produit dans le chat (traitée par le connecteur Open Food Facts)."""
-    with st.expander("📷 Scanner un produit (webcam)", expanded=False):
-        if not use_off:
-            st.caption("Active le connecteur **Nutri (OFF)** pour scanner un produit.")
-            return
-        if not _BARCODE_OK:
-            st.caption("Module de scan indisponible (`pip install zxing-cpp`).")
-            return
-        st.caption("Vise le code-barres du produit puis prends la photo.")
-        photo = st.camera_input("Code-barres", key="scan_cam", label_visibility="collapsed")
-        if photo is None:
-            return
-        img_bytes = photo.getvalue()
-        h = hashlib.md5(img_bytes).hexdigest()
-        if st.session_state.get("last_scan_hash") == h:
-            return  # déjà traité (évite la boucle de rerun)
-        st.session_state.last_scan_hash = h
-        ean = _decode_barcode(img_bytes)
-        if not ean:
-            st.warning("Aucun code-barres détecté. Recadre, rapproche, et réessaie.")
-            return
-        st.success(f"Code détecté : **{ean}**")
-        st.session_state.pending_scan_prompt = (
-            f"Le code-barres scanné est {ean}. Donne la fiche Open Food Facts de ce "
-            "produit (Nutri-Score, NOVA, additifs, allergènes, valeurs nutritionnelles) "
-            "puis ton avis nutritionnel en une phrase."
-        )
-        st.rerun()
 
 
 # ----------------------------------------------------------------- store utils
@@ -488,8 +430,6 @@ else:
     if st.session_state.history and st.session_state.history[0]["role"] == "system":
         st.session_state.history[0] = system_msg
 
-render_scanner(use_off)
-
 for m in st.session_state.history:
     if m["role"] == "user":
         with st.chat_message("user"):
@@ -499,8 +439,7 @@ for m in st.session_state.history:
             st.markdown(m["content"])
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
-typed = st.chat_input("Ex : compare le prix du saumon fumé entre Picard et Super U")
-prompt = typed or st.session_state.pop("pending_scan_prompt", None)
+prompt = st.chat_input("Ex : compare le prix du saumon fumé entre Picard et Super U")
 if prompt:
     if not API_KEY:
         st.error("Variable MISTRAL_API_KEY non définie.")
